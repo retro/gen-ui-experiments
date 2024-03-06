@@ -17,6 +17,7 @@ import { AI } from "@/app/action";
 import { AppCommandChat } from "./app-command-chat";
 import { ArrowLeftIcon } from "@radix-ui/react-icons";
 import { Button } from "./ui/button";
+import { ConversationMachineContext } from "@/app/conversation-machine-context";
 import { CreateProjectForm } from "./create-project-form";
 import { UserMessage } from "./chat-messages";
 import { useReducer } from "react";
@@ -77,7 +78,7 @@ function reducer(reducerState: ReducerState, action: ReducerAction) {
   return reducerState;
 }
 
-export function AppCommand({
+function InnerAppCommand({
   projects,
 }: {
   projects: { id: number; name: string }[];
@@ -90,19 +91,22 @@ export function AppCommand({
   });
   const [, setMessages] = useUIState<typeof AI>();
   const { submitUserMessage } = useActions();
+  const conversationActorRef = ConversationMachineContext.useActorRef();
 
   const canStartChat = state.state === "idle" && state.selected === "";
 
   const startChat = async () => {
     if (canStartChat) {
+      const id = Date.now().toString();
       setMessages((currentMessages) => [
         {
-          id: Date.now(),
+          id,
           display: <UserMessage>{state.value}</UserMessage>,
         },
       ]);
+      conversationActorRef.send({ type: "message", id });
 
-      const responseMessage = await submitUserMessage(state.value);
+      const responseMessage = await submitUserMessage(id, state.value);
 
       setMessages((currentMessages) => [...currentMessages, responseMessage]);
 
@@ -185,5 +189,17 @@ export function AppCommand({
         </CommandList>
       )}
     </Command>
+  );
+}
+
+export function AppCommand({
+  projects,
+}: {
+  projects: { id: number; name: string }[];
+}) {
+  return (
+    <ConversationMachineContext.Provider>
+      <InnerAppCommand projects={projects} />
+    </ConversationMachineContext.Provider>
   );
 }

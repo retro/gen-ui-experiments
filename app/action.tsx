@@ -5,12 +5,17 @@ import * as Schemas from "@/schemas";
 import { createAI, getMutableAIState, render } from "ai/rsc";
 
 import { AssistantMessage } from "@/components/chat-messages";
+import { ConversationActorSend } from "@/components/conversation-actor-send";
 import { CreateProjectExtendedForm } from "@/components/create-project-extended-form";
+import Markdown from "react-markdown";
 import { OpenAI } from "openai";
+import { conversationMachine } from "./conversation-machine";
+import { createActor } from "xstate";
 import exp from "constants";
 import { parseWithZod } from "@conform-to/zod";
 import prisma from "@/lib/prisma";
 import { redirect } from "next/navigation";
+import v from "voca";
 import { z } from "zod";
 
 export async function createProject(prevState: unknown, formData: FormData) {
@@ -127,7 +132,7 @@ const openai = new OpenAI({
   organization: process.env.OPENAI_ORG_ID,
 });
 
-async function submitUserMessage(userInput: string) {
+async function submitUserMessage(userMessageId: string, userInput: string) {
   "use server";
 
   const aiState = getMutableAIState<typeof AI>();
@@ -150,8 +155,22 @@ async function submitUserMessage(userInput: string) {
   );
 
   const id = Date.now().toString();
+  const currentAiState = aiState.get();
+  const conversationActor = createActor(conversationMachine);
 
-  console.log(aiState.get());
+  conversationActor.start();
+
+  for (const message of currentAiState) {
+    if (message.role === "function") {
+      conversationActor.send({ type: message.name ?? "", id: message.id });
+    } else {
+      conversationActor.send({ type: "message", id: message.id });
+    }
+  }
+
+  const conversationMachineContext = conversationActor.getSnapshot().context;
+
+  conversationActor.stop();
 
   // Update AI state with new message.
   aiState.update([
@@ -159,8 +178,108 @@ async function submitUserMessage(userInput: string) {
     {
       role: "user",
       content: userInput,
+      id: userMessageId,
     },
   ]);
+
+  const tools = {
+    create_project: {
+      help: "Start a process of a project creation",
+      description:
+        "Display properties of project that is being created. Call this tool if user wants to create a new project.",
+      parameters: Schemas.CreateProjectExtended,
+      render: async function* (raw: unknown) {
+        // It seems that the argument passed to `render` function is actually a string although it's typed
+        // as whatever the `parameters` return type is. We need to parse it to JSON first.
+        const payload = Schemas.CreateProjectExtended.parse(
+          JSON.parse(raw as unknown as string)
+        );
+
+        aiState.done([
+          ...aiState.get(),
+          {
+            role: "function",
+            name: "create_project",
+            content: JSON.stringify(payload, null, 2),
+            id,
+          },
+        ]);
+
+        console.log(payload);
+
+        return (
+          <>
+            <ConversationActorSend id={id} type="create_project" />
+            <CreateProjectExtendedForm
+              name={payload.name}
+              tasks={payload.tasks}
+            />
+          </>
+        );
+      },
+    },
+    update_project: {
+      help: "Update project properties",
+      description: updateProjectDescription,
+      parameters: Schemas.CreateProjectExtended,
+      render: async function* (raw: unknown) {
+        // It seems that the argument passed to `render` function is actually a string although it's typed
+        // as whatever the `parameters` type is. We need to parse it to JSON first.
+        const payload = Schemas.CreateProjectExtended.parse(
+          JSON.parse(raw as unknown as string)
+        );
+
+        aiState.done([
+          ...aiState.get(),
+          {
+            role: "function",
+            name: "update_project",
+            content: JSON.stringify(payload),
+            id,
+          },
+        ]);
+
+        return (
+          <>
+            <ConversationActorSend id={id} type="update_project" />
+            <CreateProjectExtendedForm
+              name={payload.name}
+              tasks={payload.tasks}
+            />
+          </>
+        );
+      },
+    },
+    cancel: {
+      help: "Cancel the current process.",
+      description: "Cancels the current process.",
+      parameters: z.object({}),
+      render: async function* () {
+        aiState.done([
+          ...aiState.get(),
+          {
+            role: "function",
+            name: "cancel",
+            content: "",
+            id,
+          },
+        ]);
+
+        return (
+          <AssistantMessage>
+            <ConversationActorSend id={id} type="cancel" />
+            <Markdown>Process canceled</Markdown>
+          </AssistantMessage>
+        );
+      },
+    },
+  };
+
+  const availableTools = Object.fromEntries(
+    Object.entries(tools).filter(([toolName]) =>
+      conversationMachineContext.availableTools.has(toolName)
+    )
+  );
 
   // render() returns a stream of UI components
   const ui = render({
@@ -170,12 +289,24 @@ async function submitUserMessage(userInput: string) {
       {
         role: "system",
         content: `\
-You are a project manager assistant. Your job is to take user's input and call one of the provided tools with appropriate payload.`,
+${conversationMachineContext.systemPrompt}
+
+If user asks for help or what are the capabilities of this assistant, list the capabilities:
+
+${Object.entries(availableTools)
+  .map(
+    ([toolName, tool]) =>
+      `- **${v.titleCase(v.words(toolName).join(" "))}**: ${
+        tool.help ?? tool.description
+      }`
+  )
+  .join("\n")}
+`,
       },
       { role: "user", content: userInput },
     ],
     // `text` is called when an AI returns a text response (as opposed to a tool call)
-    text: ({ content, done }) => {
+    text: async function* ({ content, done }) {
       // text can be streamed from the LLM, but we only want to close the stream with .done() when its completed.
       // done() marks the state as available for the client to access
       if (done) {
@@ -189,69 +320,14 @@ You are a project manager assistant. Your job is to take user's input and call o
         ]);
       }
 
-      return <AssistantMessage>{content}</AssistantMessage>;
+      return (
+        <AssistantMessage>
+          <ConversationActorSend id={id} type="message" />
+          <Markdown>{content}</Markdown>
+        </AssistantMessage>
+      );
     },
-    tools: {
-      create_project: {
-        description:
-          "Display properties of project that is being created. Call this tool if user wants to create a new project.",
-        parameters: Schemas.CreateProjectExtended,
-        render: async function* (raw) {
-          // It seems that the argument passed to `render` function is actually a string although it's typed
-          // as whatever the `parameters` return type is. We need to parse it to JSON first.
-          const payload = Schemas.CreateProjectExtended.parse(
-            JSON.parse(raw as unknown as string)
-          );
-
-          aiState.done([
-            ...aiState.get(),
-            {
-              role: "function",
-              name: "create_project",
-              content: JSON.stringify(payload, null, 2),
-              id,
-            },
-          ]);
-
-          console.log(payload);
-
-          return (
-            <CreateProjectExtendedForm
-              name={payload.name}
-              tasks={payload.tasks}
-            />
-          );
-        },
-      },
-      update_project: {
-        description: updateProjectDescription,
-        parameters: Schemas.CreateProjectExtended,
-        render: async function* (raw) {
-          // It seems that the argument passed to `render` function is actually a string although it's typed
-          // as whatever the `parameters` type is. We need to parse it to JSON first.
-          const payload = Schemas.CreateProjectExtended.parse(
-            JSON.parse(raw as unknown as string)
-          );
-
-          aiState.done([
-            ...aiState.get(),
-            {
-              role: "function",
-              name: "update_project",
-              content: JSON.stringify(payload),
-              id,
-            },
-          ]);
-
-          return (
-            <CreateProjectExtendedForm
-              name={payload.name}
-              tasks={payload.tasks}
-            />
-          );
-        },
-      },
-    },
+    tools: { ...availableTools },
   });
 
   return {
@@ -264,7 +340,7 @@ You are a project manager assistant. Your job is to take user's input and call o
 const initialAIState: {
   role: "user" | "assistant" | "system" | "function";
   content: string;
-  id?: string;
+  id: string;
   name?: string;
 }[] = [];
 
@@ -272,7 +348,7 @@ export type AIState = typeof initialAIState;
 
 // The initial UI state that the client will keep track of.
 const initialUIState: {
-  id: number;
+  id: string;
   display: React.ReactNode;
 }[] = [];
 
